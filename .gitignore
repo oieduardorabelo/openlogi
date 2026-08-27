@@ -1,0 +1,6 @@
+.build/
+.swiftpm/
+dist/
+tmp/
+.openlogi-signing/
+.DS_Store

@@ -1,0 +1,11 @@
+[tasks.build]
+run = "swift build"
+
+[tasks.test]
+run = "swift test"
+
+[tasks.dev]
+run = "swift run OpenLogi"
+
+[tasks.package]
+run = "scripts/package-app.sh"

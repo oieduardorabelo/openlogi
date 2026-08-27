@@ -1,0 +1,16 @@
+[req]
+default_bits = 2048
+prompt = no
+distinguished_name = subject
+x509_extensions = extensions
+
+[subject]
+CN = OpenLogi Local Development
+O = OpenLogi
+
+[extensions]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = codeSigning
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer

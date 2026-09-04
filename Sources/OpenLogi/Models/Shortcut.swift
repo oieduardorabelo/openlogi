@@ -80,9 +80,7 @@ struct KeyStroke: Codable, Hashable, Sendable {
             let prefix = Self.functionKeyCodes.contains(keyCode) ? "Standard " : ""
             return displayModifiers.displayName + prefix + name
         case .logitechFunction:
-            var displayModifiers = modifiers
-            displayModifiers.remove(.function)
-            return displayModifiers.displayName + "Logi " + (Self.keyboardNames[keyCode] ?? "F-key \(keyCode)")
+            return "Logi " + (Self.keyboardNames[keyCode] ?? "F-key \(keyCode)")
         case .media:
             return Self.mediaNames[keyCode] ?? "Special \(keyCode)"
         }
@@ -92,9 +90,26 @@ struct KeyStroke: Codable, Hashable, Sendable {
         if kind == .media, keyCode == Int(NX_KEYTYPE_LAUNCH_PANEL) {
             return .logitechFunction(118)
         }
-        guard (kind == .keyboard || kind == .logitechFunction),
-              Self.functionKeyCodes.contains(keyCode) else { return self }
+
+        if kind == .logitechFunction {
+            var normalized = self
+            normalized.modifiers = []
+            return normalized
+        }
+
+        guard kind == .keyboard, Self.functionKeyCodes.contains(keyCode) else { return self }
         var normalized = self
+        normalized.modifiers.remove(.function)
+        return normalized
+    }
+
+    /// HID++ function-key reports identify a physical Logitech key, not an
+    /// event type that Quartz can synthesize. Emit the corresponding standard
+    /// macOS function key when one is selected as an output.
+    var normalizedForOutput: Self {
+        guard kind == .logitechFunction else { return self }
+        var normalized = self
+        normalized.kind = .keyboard
         normalized.modifiers.remove(.function)
         return normalized
     }
@@ -279,7 +294,7 @@ struct ShortcutRule: Identifiable, Codable, Equatable, Sendable {
         input: KeyStroke = .keyboard(0),
         output: KeyStroke = .keyboard(11),
         systemAction: SystemAction? = nil,
-        isEnabled: Bool = true
+        isEnabled: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -290,6 +305,6 @@ struct ShortcutRule: Identifiable, Codable, Equatable, Sendable {
     }
 
     var targetDisplayName: String {
-        systemAction?.displayName ?? output.displayName
+        systemAction?.displayName ?? output.normalizedForOutput.displayName
     }
 }

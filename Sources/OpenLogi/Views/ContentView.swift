@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 struct ContentView: View {
-    let store: ShortcutStore
+    @ObservedObject var store: ShortcutStore
     let engine: KeyboardEngine
     let fnLock: LogitechFnLockController
 
@@ -15,6 +15,9 @@ struct ContentView: View {
                 Rectangle()
                     .fill(AppBrand.lava)
                     .frame(height: 3)
+                if let persistenceError = store.persistenceError {
+                    PersistenceErrorBanner(message: persistenceError)
+                }
                 RulesContent(store: store, engine: engine)
                 InputMonitor(activity: engine.activity)
             }
@@ -34,6 +37,21 @@ struct ContentView: View {
         .background {
             EngineLifecycleObserver(engine: engine, fnLock: fnLock)
         }
+    }
+}
+
+private struct PersistenceErrorBanner: View {
+    let message: String
+
+    var body: some View {
+        Label(message, systemImage: "externaldrive.badge.exclamationmark")
+            .font(AppBrand.font(size: 12, weight: .medium))
+            .foregroundStyle(AppBrand.lava)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 9)
+            .background(AppBrand.lava.opacity(0.08))
+            .help(message)
     }
 }
 
@@ -67,7 +85,9 @@ private struct EngineLifecycleObserver: View {
     @State private var isApplicationActive = NSApplication.shared.isActive
 
     private var shouldRetryPermission: Bool {
-        isApplicationActive && engine.status == .permissionRequired
+        guard isApplicationActive else { return false }
+        if case .permissionRequired = engine.status { return true }
+        return false
     }
 
     var body: some View {
@@ -175,37 +195,66 @@ private struct ContentHeader: View {
             .fixedSize()
             .disabled(fnLock.isBusy)
             .help("\(deviceName): ON makes bare F1–F12 send standard function keys")
-        case .unavailable:
-            Button("Detect Fn mode", action: fnLock.refresh)
-                .buttonStyle(BrandButtonStyle(kind: .secondary))
-                .font(AppBrand.font(size: 12, weight: .medium))
-                .disabled(fnLock.isBusy)
+        case .unavailable(let message):
+            HStack(spacing: 6) {
+                Label(message, systemImage: "keyboard.badge.exclamationmark")
+                    .lineLimit(1)
+                Button(action: fnLock.refresh) {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Detect Fn mode again")
+            }
+            .font(AppBrand.font(size: 11, weight: .medium))
+            .foregroundStyle(AppBrand.secondaryText)
+            .disabled(fnLock.isBusy)
+            .help(message)
         }
     }
 
     private var statusBadge: some View {
-        Label(engine.status.label, systemImage: statusIcon)
-            .font(AppBrand.font(size: 12, weight: .medium))
-            .foregroundStyle(statusColor)
+        VStack(alignment: .leading, spacing: 2) {
+            Label(engine.status.label, systemImage: statusIcon)
+                .font(AppBrand.font(size: 12, weight: .medium))
+                .foregroundStyle(statusColor)
+            switch engine.logitechInputStatus {
+            case .connecting:
+                Label("Connecting Logitech F-keys…", systemImage: "keyboard")
+                    .foregroundStyle(AppBrand.secondaryText)
+            case .unavailable(let message):
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(AppBrand.lava)
+            case .inactive, .active:
+                EmptyView()
+            }
+        }
+        .font(AppBrand.font(size: 10, weight: .medium))
     }
 
     @ViewBuilder
     private var permissionActions: some View {
-        if engine.status == .permissionRequired {
+        if case .permissionRequired(let permissions) = engine.status {
             if engine.hasRequestedPermission {
                 Button("Check Again") { engine.start() }
                     .buttonStyle(BrandButtonStyle(kind: .primary))
             } else {
-                Button("Grant Access") { engine.requestAccessibilityPermission() }
+                Button("Grant Access") { engine.requestRequiredPermissions() }
                     .buttonStyle(BrandButtonStyle(kind: .primary))
             }
-            Button("Open Settings") { engine.openAccessibilitySettings() }
-                .buttonStyle(BrandButtonStyle(kind: .secondary))
+            Menu {
+                ForEach(KeyboardEngine.RequiredPermission.allCases.filter(permissions.contains)) { permission in
+                    Button(permission.displayName) { engine.openSettings(for: permission) }
+                }
+            } label: {
+                Text("Open Settings")
+                    .font(AppBrand.font(size: 12, weight: .semibold))
+                    .brandControlChrome()
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
         } else if case .failed = engine.status {
             Button("Retry") { engine.start() }
                 .buttonStyle(BrandButtonStyle(kind: .primary))
-            Button("Open Settings") { engine.openAccessibilitySettings() }
-                .buttonStyle(BrandButtonStyle(kind: .secondary))
         }
     }
 

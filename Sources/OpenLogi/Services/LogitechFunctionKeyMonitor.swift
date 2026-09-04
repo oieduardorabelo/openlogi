@@ -2,11 +2,19 @@ import Foundation
 import IOKit.hid
 
 final class LogitechFunctionKeyMonitor: @unchecked Sendable {
+    enum Status: Equatable, Sendable {
+        case inactive
+        case connecting
+        case active(deviceName: String)
+        case unavailable(String)
+    }
+
     private let commandQueue = DispatchQueue(
         label: "com.openlogi.logitech-function-keys",
         qos: .userInitiated
     )
     private let onKey: @Sendable (Int, Bool) -> Void
+    private let onStatus: @Sendable (Status) -> Void
     private var watcher: LogitechKeyboardWatcher?
     private var session: Session?
     private var nextSessionGeneration: UInt64 = 0
@@ -19,9 +27,14 @@ final class LogitechFunctionKeyMonitor: @unchecked Sendable {
     private var requiredPositions = Set<Int>()
     private var captureAll = false
     private var isStopped = false
+    private var status: Status = .inactive
 
-    init(onKey: @escaping @Sendable (Int, Bool) -> Void) {
+    init(
+        onKey: @escaping @Sendable (Int, Bool) -> Void,
+        onStatus: @escaping @Sendable (Status) -> Void = { _ in }
+    ) {
         self.onKey = onKey
+        self.onStatus = onStatus
         watcher = LogitechKeyboardWatcher { [weak self] change in
             guard let self else { return }
             commandQueue.async { [weak self] in
@@ -47,6 +60,7 @@ final class LogitechFunctionKeyMonitor: @unchecked Sendable {
             guard !isStopped else { return }
             isStopped = true
             stopSession(restoringDiversions: true)
+            setStatus(.inactive)
         }
         watcher?.close()
         watcher = nil
@@ -59,6 +73,7 @@ final class LogitechFunctionKeyMonitor: @unchecked Sendable {
 
         guard !requiredPositions.isEmpty || captureAll else {
             stopSession(restoringDiversions: true)
+            setStatus(.inactive)
             return
         }
         startIfNeeded()
@@ -92,7 +107,9 @@ final class LogitechFunctionKeyMonitor: @unchecked Sendable {
 
     private func startIfNeeded() {
         guard session == nil else { return }
-        for device in Session.matchingDevices() {
+        setStatus(.connecting)
+        let devices = Session.matchingDevices()
+        for device in devices {
             nextSessionGeneration &+= 1
             let generation = nextSessionGeneration
             guard let candidate = Session(device: device, onReport: { [weak self] report in
@@ -113,8 +130,13 @@ final class LogitechFunctionKeyMonitor: @unchecked Sendable {
             positionsByControl = Dictionary(
                 uniqueKeysWithValues: discovery.controls.map { ($0.value, $0.key) }
             )
+            setStatus(.active(deviceName: candidate.deviceName))
             return
         }
+        let message = devices.isEmpty
+            ? "Logitech keyboard not connected or accessible"
+            : "Connected Logitech keyboard does not support direct F-key remapping"
+        setStatus(.unavailable(message))
     }
 
     private func discoverControls(in session: Session) -> (featureIndex: UInt8, controls: [Int: UInt16])? {
@@ -140,17 +162,62 @@ final class LogitechFunctionKeyMonitor: @unchecked Sendable {
     private func applyDiversions() {
         guard let session, let featureIndex else { return }
         let desiredPositions = captureAll ? Set(controlsByPosition.keys) : requiredPositions
+        let unavailablePositions = desiredPositions.subtracting(controlsByPosition.keys)
         let desiredControlIDs = Set(desiredPositions.compactMap { controlsByPosition[$0] })
 
-        for controlID in divertedControlIDs.subtracting(desiredControlIDs) {
+        removeDiversions(
+            divertedControlIDs.subtracting(desiredControlIDs),
+            featureIndex: featureIndex,
+            session: session
+        )
+        addDiversions(
+            desiredControlIDs.subtracting(divertedControlIDs),
+            featureIndex: featureIndex,
+            session: session
+        )
+        reportDiversionStatus(
+            desiredControlIDs: desiredControlIDs,
+            unavailablePositions: unavailablePositions,
+            deviceName: session.deviceName
+        )
+    }
+
+    private func removeDiversions(
+        _ controlIDs: Set<UInt16>,
+        featureIndex: UInt8,
+        session: Session
+    ) {
+        for controlID in controlIDs {
             if setDiverted(false, controlID: controlID, featureIndex: featureIndex, session: session) {
                 divertedControlIDs.remove(controlID)
             }
         }
-        for controlID in desiredControlIDs.subtracting(divertedControlIDs) {
+    }
+
+    private func addDiversions(
+        _ controlIDs: Set<UInt16>,
+        featureIndex: UInt8,
+        session: Session
+    ) {
+        for controlID in controlIDs {
             if setDiverted(true, controlID: controlID, featureIndex: featureIndex, session: session) {
                 divertedControlIDs.insert(controlID)
             }
+        }
+    }
+
+    private func reportDiversionStatus(
+        desiredControlIDs: Set<UInt16>,
+        unavailablePositions: Set<Int>,
+        deviceName: String
+    ) {
+        if !unavailablePositions.isEmpty {
+            let keys = unavailablePositions.sorted().map { "F\($0)" }.joined(separator: ", ")
+            setStatus(.unavailable("Direct remapping is unavailable for \(keys) on this keyboard"))
+        } else if divertedControlIDs.isSuperset(of: desiredControlIDs) {
+            setStatus(.active(deviceName: deviceName))
+        } else {
+            setStatus(.unavailable("Could not enable direct Logitech F-key access"))
         }
     }
 
@@ -208,6 +275,12 @@ final class LogitechFunctionKeyMonitor: @unchecked Sendable {
             onKey(keyCode, false)
         }
         pressedControlIDs = current
+    }
+
+    private func setStatus(_ newStatus: Status) {
+        guard status != newStatus else { return }
+        status = newStatus
+        onStatus(newStatus)
     }
 
     private final class Receiver: @unchecked Sendable {
@@ -279,6 +352,7 @@ final class LogitechFunctionKeyMonitor: @unchecked Sendable {
         )
         private let cancellation = DispatchSemaphore(value: 0)
         private var isClosed = false
+        let deviceName: String
 
         static func matchingDevices() -> [IOHIDDevice] {
             let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -298,6 +372,8 @@ final class LogitechFunctionKeyMonitor: @unchecked Sendable {
                 return nil
             }
             self.device = device
+            deviceName = IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String
+                ?? "Logitech keyboard"
             reportBuffer = .allocate(capacity: 64)
             reportBuffer.initialize(repeating: 0, count: 64)
 

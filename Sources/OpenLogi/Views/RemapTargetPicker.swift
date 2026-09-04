@@ -13,7 +13,7 @@ struct RemapTargetPicker: View {
         Menu {
             Button {
                 engine.captureNext(owner: captureOwner) { captured in
-                    rule.output = captured
+                    rule.output = captured.normalizedForOutput
                     rule.systemAction = nil
                 }
             } label: {

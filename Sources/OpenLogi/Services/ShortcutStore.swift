@@ -16,14 +16,17 @@ final class ShortcutStore: ObservableObject {
         didSet { scheduleSave() }
     }
 
+    @Published private(set) var persistenceError: String?
+
     private let fileURL: URL
     private let persistenceWriter: PersistenceWriter
     private var isLoading = true
     private var pendingSave: Task<Void, Never>?
+    private var persistenceWritesBlocked = false
     private var firstEnabledRuleIndexByInput: [KeyStroke: Int] = [:]
     private var enabledRuleCountByInput: [KeyStroke: Int] = [:]
     private var enabledRuleCountByInputAndID: [RuleInputKey: Int] = [:]
-    private static let schemaVersion = 2
+    private static let schemaVersion = 3
 
     private struct SavedState: Codable, Sendable {
         var schemaVersion: Int?
@@ -42,18 +45,17 @@ final class ShortcutStore: ObservableObject {
         self.persistenceWriter = PersistenceWriter(fileURL: resolvedFileURL)
         self.rules = []
         self.isEnabled = true
+        self.persistenceError = nil
         let needsSave = load()
         isLoading = false
         if needsSave { flush() }
     }
 
     func addRule() {
-        isEnabled = true
         rules.append(ShortcutRule())
     }
 
     func addMissionControlRule() {
-        isEnabled = true
         let input = KeyStroke.logitechFunction(118)
         if let index = rules.firstIndex(where: {
             $0.input.normalizedForInputMatching == input.normalizedForInputMatching
@@ -96,21 +98,50 @@ final class ShortcutStore: ObservableObject {
     /// Persists the latest state before returning. Encoding and file I/O run on
     /// the store's serial persistence queue.
     func flush() {
-        guard !isLoading else { return }
+        guard !isLoading, !persistenceWritesBlocked else { return }
         pendingSave?.cancel()
         pendingSave = nil
         persistenceWriter.flush(snapshot())
     }
 
     private func load() -> Bool {
-        guard let data = try? Data(contentsOf: fileURL),
-              let state = try? JSONDecoder().decode(SavedState.self, from: data) else {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
             return false
         }
-        let shouldMigrate = (state.schemaVersion ?? 1) < Self.schemaVersion
-        rules = shouldMigrate ? state.rules.map(Self.migrateLegacyFunctionKey) : state.rules
+
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL)
+        } catch {
+            persistenceWritesBlocked = true
+            persistenceError = "Could not read shortcuts.json. The existing file was left untouched and changes will not be saved."
+            return false
+        }
+
+        let state: SavedState
+        do {
+            state = try JSONDecoder().decode(SavedState.self, from: data)
+        } catch {
+            if let recoveryURL = preserveUnreadableConfiguration(data) {
+                persistenceError = "The shortcut file was unreadable. A recovery copy was saved as \(recoveryURL.lastPathComponent)."
+            } else {
+                persistenceWritesBlocked = true
+                persistenceError = "The shortcut file was unreadable and could not be backed up. The existing file was left untouched and changes will not be saved."
+            }
+            return false
+        }
+
+        let loadedVersion = state.schemaVersion ?? 1
+        var loadedRules = state.rules
+        if loadedVersion < 2 {
+            loadedRules = loadedRules.map(Self.migrateLegacyFunctionKey)
+        }
+        if loadedVersion < 3 {
+            loadedRules = loadedRules.map(Self.migrateLogitechSemantics)
+        }
+        rules = loadedRules
         isEnabled = state.isEnabled
-        return shouldMigrate
+        return loadedVersion < Self.schemaVersion
     }
 
     private func rebuildRuleLookup() {
@@ -148,7 +179,7 @@ final class ShortcutStore: ObservableObject {
     }
 
     private func scheduleSave() {
-        guard !isLoading else { return }
+        guard !isLoading, !persistenceWritesBlocked else { return }
         pendingSave?.cancel()
         pendingSave = Task { @MainActor [weak self] in
             do {
@@ -186,6 +217,29 @@ final class ShortcutStore: ObservableObject {
         return migrated
     }
 
+    private static func migrateLogitechSemantics(_ rule: ShortcutRule) -> ShortcutRule {
+        var migrated = rule
+        migrated.input = migrated.input.normalizedForInputMatching
+        migrated.output = migrated.output.normalizedForOutput
+        return migrated
+    }
+
+    private func preserveUnreadableConfiguration(_ data: Data) -> URL? {
+        let recoveryURL = fileURL.deletingLastPathComponent().appendingPathComponent(
+            "\(fileURL.lastPathComponent).corrupt-\(UUID().uuidString).backup"
+        )
+        do {
+            try FileManager.default.createDirectory(
+                at: recoveryURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try data.write(to: recoveryURL, options: .atomic)
+            return recoveryURL
+        } catch {
+            return nil
+        }
+    }
+
     private final class PersistenceWriter: @unchecked Sendable {
         private let fileURL: URL
         private let queue = DispatchQueue(label: "com.openlogi.shortcut-persistence", qos: .utility)
@@ -216,6 +270,15 @@ final class ShortcutStore: ObservableObject {
                     at: fileURL.deletingLastPathComponent(),
                     withIntermediateDirectories: true
                 )
+                if FileManager.default.fileExists(atPath: fileURL.path) {
+                    let previousData = try Data(contentsOf: fileURL)
+                    if (try? JSONDecoder().decode(SavedState.self, from: previousData)) != nil {
+                        try previousData.write(
+                            to: fileURL.appendingPathExtension("backup"),
+                            options: .atomic
+                        )
+                    }
+                }
                 try data.write(to: fileURL, options: .atomic)
             } catch {
                 assertionFailure("Could not save shortcuts: \(error)")

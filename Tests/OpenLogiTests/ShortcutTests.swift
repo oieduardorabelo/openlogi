@@ -62,11 +62,19 @@ final class ShortcutTests: XCTestCase {
             subtype: 8,
             data1: Int64((keyCode << 16) | (0x0b << 8))
         )
+        let repeatedDown = KeyboardEventWorker.parseMediaKey(
+            subtype: 8,
+            data1: Int64((keyCode << 16) | (0x0a << 8) | 0x1)
+        )
 
         XCTAssertEqual(down?.stroke, .media(keyCode))
         XCTAssertEqual(down?.isDown, true)
+        XCTAssertEqual(down?.isRepeat, false)
         XCTAssertEqual(up?.stroke, .media(keyCode))
         XCTAssertEqual(up?.isDown, false)
+        XCTAssertEqual(repeatedDown?.stroke, .media(keyCode))
+        XCTAssertEqual(repeatedDown?.isDown, true)
+        XCTAssertEqual(repeatedDown?.isRepeat, true)
         XCTAssertNil(KeyboardEventWorker.parseMediaKey(subtype: 7, data1: 0))
         XCTAssertNil(KeyboardEventWorker.parseMediaKey(subtype: 8, data1: 0))
     }
@@ -96,6 +104,48 @@ final class ShortcutTests: XCTestCase {
         XCTAssertEqual(standardF4.displayName, "Standard F4")
         XCTAssertEqual(logitechF4.displayName, "Logi F4")
         XCTAssertNotEqual(standardF4.normalizedForInputMatching, logitechF4.normalizedForInputMatching)
+    }
+
+    func testLogitechModifiersAreIgnoredForInputMatching() {
+        let shiftedF4 = KeyStroke.logitechFunction(118, modifiers: [.shift, .function])
+
+        XCTAssertEqual(shiftedF4.displayName, "Logi F4")
+        XCTAssertEqual(shiftedF4.normalizedForInputMatching, .logitechFunction(118))
+    }
+
+    func testLogitechOutputNormalizesToStandardFunctionKey() {
+        let captured = KeyStroke.logitechFunction(118, modifiers: [.shift, .function])
+
+        XCTAssertEqual(
+            captured.normalizedForOutput,
+            .keyboard(118, modifiers: .shift)
+        )
+        XCTAssertEqual(
+            ShortcutRule(output: captured).targetDisplayName,
+            "⇧Standard F4"
+        )
+    }
+
+    func testEventWorkerMatchesModifierVariantForDivertedLogitechKey() {
+        let rule = ShortcutRule(
+            input: .logitechFunction(118),
+            output: .keyboard(0),
+            isEnabled: true
+        )
+        let executed = expectation(description: "diverted Logitech rule executes")
+        let worker = KeyboardEventWorker { executedRule in
+            XCTAssertEqual(executedRule, rule)
+            executed.fulfill()
+        }
+        worker.update(rules: [rule], isEnabled: true)
+
+        worker.handleLogitechFunctionKey(
+            keyCode: 118,
+            isDown: true,
+            modifiers: [.shift, .option]
+        )
+
+        wait(for: [executed], timeout: 0.1)
     }
 
     func testLogitechFnStateParsing() {
@@ -169,8 +219,8 @@ final class ShortcutTests: XCTestCase {
         XCTAssertNil(SystemAction.missionControl.shortcut)
     }
 
-    func testNewRulesDefaultToEnabled() {
-        XCTAssertTrue(ShortcutRule().isEnabled)
+    func testNewRulesDefaultToDisabled() {
+        XCTAssertFalse(ShortcutRule().isEnabled)
     }
 
     func testEverySystemActionHasAGroup() {
@@ -195,8 +245,8 @@ final class ShortcutTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = ShortcutStore(fileURL: directory.appendingPathComponent("shortcuts.json"))
         let disabled = ShortcutRule(input: .keyboard(0), output: .keyboard(1), isEnabled: false)
-        let first = ShortcutRule(input: .keyboard(0), output: .keyboard(2))
-        let second = ShortcutRule(input: .keyboard(0), output: .keyboard(3))
+        let first = ShortcutRule(input: .keyboard(0), output: .keyboard(2), isEnabled: true)
+        let second = ShortcutRule(input: .keyboard(0), output: .keyboard(3), isEnabled: true)
 
         store.rules = [disabled, first, second]
 
@@ -209,7 +259,12 @@ final class ShortcutTests: XCTestCase {
     func testStoreLookupReturnsLatestNonTopologyEdits() {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = ShortcutStore(fileURL: directory.appendingPathComponent("shortcuts.json"))
-        store.rules = [ShortcutRule(name: "Before", input: .keyboard(0), output: .keyboard(1))]
+        store.rules = [ShortcutRule(
+            name: "Before",
+            input: .keyboard(0),
+            output: .keyboard(1),
+            isEnabled: true
+        )]
 
         store.rules[0].name = "After"
         store.rules[0].output = .keyboard(2)
@@ -222,8 +277,11 @@ final class ShortcutTests: XCTestCase {
     func testDuplicateLookupUsesNormalizedEnabledInputs() {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = ShortcutStore(fileURL: directory.appendingPathComponent("shortcuts.json"))
-        let first = ShortcutRule(input: .keyboard(118))
-        let duplicate = ShortcutRule(input: .keyboard(118, modifiers: .function))
+        let first = ShortcutRule(input: .keyboard(118), isEnabled: true)
+        let duplicate = ShortcutRule(
+            input: .keyboard(118, modifiers: .function),
+            isEnabled: true
+        )
         let disabledDuplicate = ShortcutRule(input: .keyboard(118), isEnabled: false)
         store.rules = [first, duplicate, disabledDuplicate]
 
@@ -256,19 +314,23 @@ final class ShortcutTests: XCTestCase {
     func testStoreMatchesF4RegardlessOfFunctionFlag() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = ShortcutStore(fileURL: directory.appendingPathComponent("shortcuts.json"))
-        let rule = ShortcutRule(input: .keyboard(118), systemAction: .missionControl)
+        let rule = ShortcutRule(
+            input: .keyboard(118),
+            systemAction: .missionControl,
+            isEnabled: true
+        )
         store.rules = [rule]
         XCTAssertEqual(store.rule(for: .keyboard(118, modifiers: .function)), rule)
     }
 
     @MainActor
-    func testAddingRuleEnablesRemapping() throws {
+    func testAddingRulePreservesMasterSwitchAndStartsDisabled() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = ShortcutStore(fileURL: directory.appendingPathComponent("shortcuts.json"))
         store.isEnabled = false
         store.addRule()
-        XCTAssertTrue(store.isEnabled)
-        XCTAssertTrue(store.rules[0].isEnabled)
+        XCTAssertFalse(store.isEnabled)
+        XCTAssertFalse(store.rules[0].isEnabled)
     }
 
     @MainActor
@@ -302,6 +364,106 @@ final class ShortcutTests: XCTestCase {
         let store = ShortcutStore(fileURL: fileURL)
         XCTAssertEqual(store.rules[0].input.kind, .logitechFunction)
         XCTAssertEqual(store.rules[0].input.displayName, "Logi F4")
-        XCTAssertTrue(try String(contentsOf: fileURL).contains("\"schemaVersion\" : 2"))
+        XCTAssertTrue(try String(contentsOf: fileURL).contains("\"schemaVersion\" : 3"))
+    }
+
+    @MainActor
+    func testVersionTwoLogitechOutputsMigrateToStandardFunctionKeys() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = directory.appendingPathComponent("shortcuts.json")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let versionTwo = """
+        {
+          "schemaVersion": 2,
+          "isEnabled": true,
+          "rules": [{
+            "id": "9162C242-48A7-40EE-A0DB-D28BFAD65BB9",
+            "input": {"keyCode": 118, "kind": "logitechFunction", "modifiers": 8},
+            "isEnabled": true,
+            "name": "Logitech target",
+            "output": {"keyCode": 118, "kind": "logitechFunction", "modifiers": 24}
+          }]
+        }
+        """
+        try Data(versionTwo.utf8).write(to: fileURL)
+
+        let store = ShortcutStore(fileURL: fileURL)
+
+        XCTAssertEqual(store.rules[0].input, .logitechFunction(118))
+        XCTAssertEqual(store.rules[0].output, .keyboard(118, modifiers: .shift))
+        XCTAssertTrue(try String(contentsOf: fileURL).contains("\"schemaVersion\" : 3"))
+    }
+
+    @MainActor
+    func testUnreadableConfigurationIsPreservedBeforeReplacement() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = directory.appendingPathComponent("shortcuts.json")
+        let corruptData = Data("not valid json".utf8)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try corruptData.write(to: fileURL)
+
+        let store = ShortcutStore(fileURL: fileURL)
+
+        XCTAssertTrue(store.rules.isEmpty)
+        XCTAssertNotNil(store.persistenceError)
+        let recoveryURLs = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).filter { $0.lastPathComponent.contains(".corrupt-") }
+        XCTAssertEqual(recoveryURLs.count, 1)
+        XCTAssertEqual(try Data(contentsOf: recoveryURLs[0]), corruptData)
+
+        store.addRule()
+        store.flush()
+
+        let reloaded = ShortcutStore(fileURL: fileURL)
+        XCTAssertEqual(reloaded.rules.count, 1)
+        XCTAssertNil(reloaded.persistenceError)
+        XCTAssertEqual(try Data(contentsOf: recoveryURLs[0]), corruptData)
+    }
+
+    @MainActor
+    func testSavingKeepsPreviousConfigurationBackup() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = directory.appendingPathComponent("shortcuts.json")
+        let store = ShortcutStore(fileURL: fileURL)
+        store.rules = [ShortcutRule(name: "Previous")]
+        store.flush()
+        store.rules[0].name = "Current"
+        store.flush()
+
+        let backup = try String(contentsOf: fileURL.appendingPathExtension("backup"))
+        XCTAssertTrue(backup.contains("Previous"))
+        XCTAssertFalse(backup.contains("Current"))
+    }
+
+    @MainActor
+    func testCorruptPrimaryDoesNotOverwriteKnownGoodBackup() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = directory.appendingPathComponent("shortcuts.json")
+        let backupURL = fileURL.appendingPathExtension("backup")
+        let store = ShortcutStore(fileURL: fileURL)
+        store.rules = [ShortcutRule(name: "Known good")]
+        store.flush()
+        store.rules[0].name = "Latest good"
+        store.flush()
+        let knownGoodBackup = try Data(contentsOf: backupURL)
+
+        try Data("damaged primary".utf8).write(to: fileURL)
+        let recoveringStore = ShortcutStore(fileURL: fileURL)
+        recoveringStore.addRule()
+        recoveringStore.flush()
+
+        XCTAssertEqual(try Data(contentsOf: backupURL), knownGoodBackup)
+        XCTAssertNotNil(recoveringStore.persistenceError)
+    }
+
+    @MainActor
+    func testPermissionStatusNamesEveryMissingPermission() {
+        let status = KeyboardEngine.Status.permissionRequired([.accessibility, .inputMonitoring])
+        XCTAssertEqual(
+            status.label,
+            "Accessibility and Input Monitoring permissions required"
+        )
     }
 }

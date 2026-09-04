@@ -15,25 +15,50 @@ final class KeyboardInputActivity: ObservableObject {
 
 @MainActor
 final class KeyboardEngine: ObservableObject {
+    enum RequiredPermission: String, CaseIterable, Identifiable, Sendable {
+        case accessibility
+        case inputMonitoring
+
+        var id: Self { self }
+
+        var displayName: String {
+            switch self {
+            case .accessibility: "Accessibility"
+            case .inputMonitoring: "Input Monitoring"
+            }
+        }
+    }
+
     enum Status: Equatable {
         case stopped
-        case permissionRequired
+        case permissionRequired(Set<RequiredPermission>)
         case running
         case failed(String)
 
         var label: String {
             switch self {
             case .stopped: "Stopped"
-            case .permissionRequired: "Accessibility permission required"
-            case .running: "Permissions granted · Active"
+            case .permissionRequired(let permissions):
+                Self.permissionLabel(permissions)
+            case .running: "Keyboard remapping active"
             case .failed(let message): message
             }
+        }
+
+        private static func permissionLabel(_ permissions: Set<RequiredPermission>) -> String {
+            let names = RequiredPermission.allCases
+                .filter(permissions.contains)
+                .map(\.displayName)
+            guard !names.isEmpty else { return "Permissions required" }
+            let noun = names.count == 1 ? "permission" : "permissions"
+            return "\(names.joined(separator: " and ")) \(noun) required"
         }
     }
 
     @Published private(set) var status: Status = .stopped
     @Published private(set) var captureOwner: UUID?
     @Published private(set) var hasRequestedPermission = false
+    @Published private(set) var logitechInputStatus: LogitechFunctionKeyMonitor.Status = .inactive
 
     var isRecording: Bool { captureOwner != nil }
 
@@ -84,13 +109,15 @@ final class KeyboardEngine: ObservableObject {
     }
 
     func start() {
-        guard AXIsProcessTrusted() else {
+        let missingPermissions = Self.missingPermissions()
+        guard missingPermissions.isEmpty else {
             cancelCapture()
             logitechFunctionKeys?.stop()
             logitechFunctionKeys = nil
             lastLogitechConfiguration = nil
+            logitechInputStatus = .inactive
             stopEventTap()
-            setStatus(.permissionRequired)
+            setStatus(.permissionRequired(missingPermissions))
             return
         }
         guard status != .running else {
@@ -110,6 +137,7 @@ final class KeyboardEngine: ObservableObject {
         logitechFunctionKeys?.stop()
         logitechFunctionKeys = nil
         lastLogitechConfiguration = nil
+        logitechInputStatus = .inactive
         stopEventTap()
         setStatus(.stopped)
     }
@@ -128,23 +156,32 @@ final class KeyboardEngine: ObservableObject {
         stop()
     }
 
-    func requestAccessibilityPermission() {
-        if AXIsProcessTrusted() {
-            start()
-            return
-        }
-        guard !hasRequestedPermission else {
+    func requestRequiredPermissions() {
+        let missingPermissions = Self.missingPermissions()
+        guard !missingPermissions.isEmpty else {
             start()
             return
         }
         hasRequestedPermission = true
-        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
+        if missingPermissions.contains(.accessibility) {
+            let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+            _ = AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
+        }
+        if missingPermissions.contains(.inputMonitoring) {
+            _ = CGRequestListenEventAccess()
+        }
         start()
     }
 
-    func openAccessibilitySettings() {
-        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+    func openSettings(for permission: RequiredPermission) {
+        let pane: String
+        switch permission {
+        case .accessibility:
+            pane = "Privacy_Accessibility"
+        case .inputMonitoring:
+            pane = "Privacy_ListenEvent"
+        }
+        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)")!
         NSWorkspace.shared.open(url)
     }
 
@@ -220,17 +257,32 @@ final class KeyboardEngine: ObservableObject {
 
         if logitechFunctionKeys == nil {
             let worker = eventWorker
-            let monitor = LogitechFunctionKeyMonitor { keyCode, isDown in
-                let flags = CGEventSource.flagsState(.combinedSessionState)
-                worker.handleLogitechFunctionKey(
-                    keyCode: keyCode,
-                    isDown: isDown,
-                    modifiers: ShortcutModifiers(eventFlags: flags)
-                )
-            }
+            let monitor = LogitechFunctionKeyMonitor(
+                onKey: { keyCode, isDown in
+                    let flags = CGEventSource.flagsState(.combinedSessionState)
+                    worker.handleLogitechFunctionKey(
+                        keyCode: keyCode,
+                        isDown: isDown,
+                        modifiers: ShortcutModifiers(eventFlags: flags)
+                    )
+                },
+                onStatus: { [weak self] status in
+                    Task { @MainActor in
+                        guard let self, self.logitechInputStatus != status else { return }
+                        self.logitechInputStatus = status
+                    }
+                }
+            )
             logitechFunctionKeys = monitor
         }
         logitechFunctionKeys?.update(requiredPositions: positions, captureAll: isRecording)
+    }
+
+    private static func missingPermissions() -> Set<RequiredPermission> {
+        var result = Set<RequiredPermission>()
+        if !AXIsProcessTrusted() { result.insert(.accessibility) }
+        if !CGPreflightListenEventAccess() { result.insert(.inputMonitoring) }
+        return result
     }
 
     private func setStatus(_ newStatus: Status) {

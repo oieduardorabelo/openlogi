@@ -47,19 +47,25 @@ final class LogitechFnLockController: ObservableObject {
         isBusy = true
         Task {
             let result = await Task.detached(priority: .userInitiated, operation: operation).value
-            isBusy = false
-            let newStatus: Status
-            switch result {
-            case .success(let deviceName, let standardFKeys):
-                newStatus = .available(deviceName: deviceName, standardFKeys: standardFKeys)
-            case .failure(let message):
-                newStatus = .unavailable(message)
-            }
-            if status != newStatus { status = newStatus }
-            if refreshRequestedWhileBusy {
-                refreshRequestedWhileBusy = false
-                refresh()
-            }
+            finish(result)
+        }
+    }
+
+    private func finish(_ result: LogitechFnHID.Result) {
+        isBusy = false
+        let newStatus = status(for: result)
+        if status != newStatus { status = newStatus }
+        guard refreshRequestedWhileBusy else { return }
+        refreshRequestedWhileBusy = false
+        refresh()
+    }
+
+    private func status(for result: LogitechFnHID.Result) -> Status {
+        switch result {
+        case .success(let deviceName, let standardFKeys):
+            .available(deviceName: deviceName, standardFKeys: standardFKeys)
+        case .failure(let message):
+            .unavailable(message)
         }
     }
 }
@@ -76,9 +82,8 @@ enum LogitechFnHID {
     }
 
     static func read() -> Result {
-        withSession { session, deviceName in
-            guard let feature = locateFnFeature(in: session),
-                  let standardFKeys = readStandardFKeys(feature, from: session) else {
+        withSession { session, feature, deviceName in
+            guard let standardFKeys = readStandardFKeys(feature, from: session) else {
                 return .failure("Fn Lock unavailable")
             }
             return .success(deviceName: deviceName, standardFKeys: standardFKeys)
@@ -86,11 +91,7 @@ enum LogitechFnHID {
     }
 
     static func write(standardFKeys: Bool) -> Result {
-        withSession { session, deviceName in
-            guard let feature = locateFnFeature(in: session) else {
-                return .failure("Fn Lock unavailable")
-            }
-
+        withSession { session, feature, deviceName in
             let swapValue: UInt8 = standardFKeys ? 0 : 1
             var parameters: [UInt8] = []
             if let host = feature.host { parameters.append(host) }
@@ -136,13 +137,39 @@ enum LogitechFnHID {
     }
 
     private static func withSession(
-        _ operation: (Session, String) -> Result
+        _ operation: (Session, Feature, String) -> Result
     ) -> Result {
-        guard let session = Session() else {
+        let devices = Session.matchingDevices()
+        guard !devices.isEmpty else {
             return .failure("Logitech keyboard not connected")
         }
-        defer { session.close() }
-        return operation(session, session.deviceName)
+
+        var openedDevice = false
+        var lastFailure: Result?
+        for device in devices {
+            guard let session = Session(device: device) else { continue }
+            openedDevice = true
+            guard let feature = locateFnFeature(in: session) else {
+                session.close()
+                continue
+            }
+
+            let result = operation(session, feature, session.deviceName)
+            session.close()
+            switch result {
+            case .success:
+                return result
+            case .failure:
+                lastFailure = result
+            }
+        }
+
+        if let lastFailure { return lastFailure }
+        return .failure(
+            openedDevice
+                ? "Fn Lock unavailable on connected Logitech keyboards"
+                : "Could not access Logitech keyboards; check Input Monitoring permission"
+        )
     }
 
     private final class Receiver {
@@ -153,24 +180,29 @@ enum LogitechFnHID {
 
     private final class Session {
         private static let softwareID: UInt8 = 0x0a
-        private let manager: IOHIDManager
         private let device: IOHIDDevice
         private let receiver = Receiver()
         private let reportBuffer: UnsafeMutablePointer<UInt8>
         let deviceName: String
 
-        init?() {
-            manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        static func matchingDevices() -> [IOHIDDevice] {
+            let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
             IOHIDManagerSetDeviceMatching(manager, [
                 kIOHIDVendorIDKey: 0x046d,
                 kIOHIDPrimaryUsagePageKey: 1,
                 kIOHIDPrimaryUsageKey: 6
             ] as CFDictionary)
-            guard IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess,
-                  let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>,
-                  let device = devices.first,
-                  IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else {
+            guard IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else {
                 IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+                return []
+            }
+            let devices = (IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>).map(Array.init) ?? []
+            IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+            return devices
+        }
+
+        init?(device: IOHIDDevice) {
+            guard IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else {
                 return nil
             }
             self.device = device
@@ -201,7 +233,6 @@ enum LogitechFnHID {
                 CFRunLoopMode.defaultMode.rawValue
             )
             IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
-            IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
             reportBuffer.deinitialize(count: 64)
             reportBuffer.deallocate()
         }

@@ -24,6 +24,20 @@ final class KeyboardEventWorker: @unchecked Sendable {
         }
     }
 
+    private struct ParsedEvent {
+        let stroke: KeyStroke
+        let isDown: Bool
+        let isRepeat: Bool
+    }
+
+    private struct EventResolution {
+        var capturedToken: UInt64?
+        var matchedRule: ShortcutRule?
+        var shouldSuppress = false
+        var inputHandler: (@Sendable (KeyStroke) -> Void)?
+        var captureHandler: (@Sendable (UInt64, KeyStroke) -> Void)?
+    }
+
     private final class StartLatch: @unchecked Sendable {
         private let condition = NSCondition()
         private var result: Bool?
@@ -54,6 +68,7 @@ final class KeyboardEventWorker: @unchecked Sendable {
     )
     private let stateLock = NSLock()
     private let lifecycleLock = NSLock()
+    private let executeRule: @Sendable (ShortcutRule) -> Void
 
     private var ruleByInput: [KeyStroke: ShortcutRule] = [:]
     private var suppressedUntilRelease = Set<PhysicalKey>()
@@ -66,6 +81,10 @@ final class KeyboardEventWorker: @unchecked Sendable {
     private var runLoopSource: CFRunLoopSource?
     private var runLoop: CFRunLoop?
     private var isStarting = false
+
+    init(executeRule: @escaping @Sendable (ShortcutRule) -> Void = { KeyboardOutput.execute($0) }) {
+        self.executeRule = executeRule
+    }
 
     func setHandlers(
         onInput: @escaping @Sendable (KeyStroke) -> Void,
@@ -133,7 +152,7 @@ final class KeyboardEventWorker: @unchecked Sendable {
         if let capturedToken {
             captureHandler?(capturedToken, stroke)
         } else if let matchedRule {
-            KeyboardOutput.execute(matchedRule)
+            executeRule(matchedRule)
         }
     }
 
@@ -225,14 +244,7 @@ final class KeyboardEventWorker: @unchecked Sendable {
 
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            stateLock.lock()
-            suppressedUntilRelease.removeAll(keepingCapacity: true)
-            lastReportedInput = nil
-            stateLock.unlock()
-            lifecycleLock.lock()
-            let eventTap = self.eventTap
-            lifecycleLock.unlock()
-            if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: true) }
+            recoverFromDisabledTap()
             return Unmanaged.passUnretained(event)
         }
         if event.getIntegerValueField(.eventSourceUserData) == KeyboardOutput.syntheticEventTag {
@@ -242,70 +254,100 @@ final class KeyboardEventWorker: @unchecked Sendable {
             return Unmanaged.passUnretained(event)
         }
 
-        let physicalKey = PhysicalKey(parsed.stroke)
-        var capturedToken: UInt64?
-        var matchedRule: ShortcutRule?
-        var suppress = false
-        var inputHandler: (@Sendable (KeyStroke) -> Void)?
-        var captureHandler: (@Sendable (UInt64, KeyStroke) -> Void)?
+        let resolution = resolve(parsed)
+        dispatch(resolution, stroke: parsed.stroke)
+        return resolution.shouldSuppress ? nil : Unmanaged.passUnretained(event)
+    }
 
+    private func recoverFromDisabledTap() {
         stateLock.lock()
-        if parsed.isDown {
-            if lastReportedInput != parsed.stroke {
-                lastReportedInput = parsed.stroke
-                inputHandler = onInput
-            }
-            if let token = captureToken {
-                captureToken = nil
-                suppressedUntilRelease.insert(physicalKey)
-                capturedToken = token
-                captureHandler = onCapture
-                suppress = true
-            } else if let rule = ruleByInput[parsed.stroke.normalizedForInputMatching] {
-                suppressedUntilRelease.insert(physicalKey)
-                if !parsed.isRepeat || rule.systemAction == nil {
-                    matchedRule = rule
-                }
-                suppress = true
-            }
-        } else {
-            if lastReportedInput?.kind == parsed.stroke.kind,
-               lastReportedInput?.keyCode == parsed.stroke.keyCode {
-                lastReportedInput = nil
-            }
-            if suppressedUntilRelease.remove(physicalKey) != nil {
-                suppress = true
-            }
-        }
+        suppressedUntilRelease.removeAll(keepingCapacity: true)
+        lastReportedInput = nil
         stateLock.unlock()
 
-        inputHandler?(parsed.stroke)
-        if let capturedToken {
-            captureHandler?(capturedToken, parsed.stroke)
-        } else if let matchedRule {
-            KeyboardOutput.execute(matchedRule)
-        }
+        lifecycleLock.lock()
+        let eventTap = self.eventTap
+        lifecycleLock.unlock()
+        if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: true) }
+    }
 
-        return suppress ? nil : Unmanaged.passUnretained(event)
+    private func resolve(_ parsed: ParsedEvent) -> EventResolution {
+        stateLock.lock()
+        let resolution = parsed.isDown
+            ? resolveKeyDownLocked(parsed)
+            : resolveKeyUpLocked(parsed)
+        stateLock.unlock()
+        return resolution
+    }
+
+    private func resolveKeyDownLocked(_ parsed: ParsedEvent) -> EventResolution {
+        let physicalKey = PhysicalKey(parsed.stroke)
+        var resolution = EventResolution()
+
+        if lastReportedInput != parsed.stroke {
+            lastReportedInput = parsed.stroke
+            resolution.inputHandler = onInput
+        }
+        if let token = captureToken {
+            captureToken = nil
+            suppressedUntilRelease.insert(physicalKey)
+            resolution.capturedToken = token
+            resolution.captureHandler = onCapture
+            resolution.shouldSuppress = true
+        } else if let rule = ruleByInput[parsed.stroke.normalizedForInputMatching] {
+            suppressedUntilRelease.insert(physicalKey)
+            if !parsed.isRepeat || rule.systemAction == nil {
+                resolution.matchedRule = rule
+            }
+            resolution.shouldSuppress = true
+        }
+        return resolution
+    }
+
+    private func resolveKeyUpLocked(_ parsed: ParsedEvent) -> EventResolution {
+        if lastReportedInput?.kind == parsed.stroke.kind,
+           lastReportedInput?.keyCode == parsed.stroke.keyCode {
+            lastReportedInput = nil
+        }
+        let wasSuppressed = suppressedUntilRelease.remove(PhysicalKey(parsed.stroke)) != nil
+        return EventResolution(shouldSuppress: wasSuppressed)
+    }
+
+    private func dispatch(_ resolution: EventResolution, stroke: KeyStroke) {
+        resolution.inputHandler?(stroke)
+        if let capturedToken = resolution.capturedToken {
+            resolution.captureHandler?(capturedToken, stroke)
+        } else if let matchedRule = resolution.matchedRule {
+            executeRule(matchedRule)
+        }
     }
 
     private func parse(
         type: CGEventType,
         event: CGEvent
-    ) -> (stroke: KeyStroke, isDown: Bool, isRepeat: Bool)? {
+    ) -> ParsedEvent? {
         if type == .keyDown || type == .keyUp {
             let keyCode = Int(event.getIntegerValueField(.keyboardEventKeycode))
             let modifiers = ShortcutModifiers(eventFlags: event.flags)
             let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
-            return (.keyboard(keyCode, modifiers: modifiers), type == .keyDown, isRepeat)
+            return ParsedEvent(
+                stroke: .keyboard(keyCode, modifiers: modifiers),
+                isDown: type == .keyDown,
+                isRepeat: isRepeat
+            )
         }
 
         guard type == Self.systemDefinedType else {
             return nil
         }
-        return Self.parseMediaKey(
+        guard let parsed = Self.parseMediaKey(
             subtype: event.getIntegerValueField(SystemDefinedEventField.subtype),
             data1: event.getIntegerValueField(SystemDefinedEventField.data1)
+        ) else { return nil }
+        return ParsedEvent(
+            stroke: parsed.stroke,
+            isDown: parsed.isDown,
+            isRepeat: parsed.isRepeat
         )
     }
 
@@ -319,7 +361,8 @@ final class KeyboardEventWorker: @unchecked Sendable {
         guard state == Self.mediaKeyDown || state == Self.mediaKeyUp else {
             return nil
         }
-        return (.media(keyCode), state == Self.mediaKeyDown, false)
+        let isRepeat = (data & 0x1) != 0
+        return (.media(keyCode), state == Self.mediaKeyDown, isRepeat)
     }
 
     private static let callback: CGEventTapCallBack = { _, type, event, userInfo in
@@ -358,9 +401,7 @@ enum KeyboardOutput {
         case .keyboard:
             postKeyboard(stroke)
         case .logitechFunction:
-            var standardStroke = stroke
-            standardStroke.kind = .keyboard
-            postKeyboard(standardStroke)
+            postKeyboard(stroke.normalizedForOutput)
         case .media:
             postMedia(stroke)
         }

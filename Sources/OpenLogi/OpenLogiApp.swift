@@ -6,14 +6,17 @@ final class AppModel: ObservableObject {
     let store: ShortcutStore
     let engine: KeyboardEngine
     let fnLock: LogitechFnLockController
+    let launchAtLogin: LaunchAtLoginController
 
     init() {
         let store = ShortcutStore()
         let fnLock = LogitechFnLockController()
         let engine = KeyboardEngine(store: store)
+        let launchAtLogin = LaunchAtLoginController()
         self.store = store
         self.engine = engine
         self.fnLock = fnLock
+        self.launchAtLogin = launchAtLogin
         engine.onFunctionModeChange = { [weak fnLock] in
             fnLock?.refresh()
         }
@@ -31,12 +34,21 @@ struct OpenLogiApp: App {
 
     var body: some Scene {
         Window("OpenLogi", id: "shortcuts") {
-            ContentView(store: model.store, engine: model.engine, fnLock: model.fnLock)
+            ContentView(
+                store: model.store,
+                engine: model.engine,
+                fnLock: model.fnLock,
+                launchAtLogin: model.launchAtLogin
+            )
         }
         .defaultSize(width: 780, height: 500)
 
         MenuBarExtra {
-            MenuBarContent(store: model.store, engine: model.engine)
+            MenuBarContent(
+                store: model.store,
+                engine: model.engine,
+                launchAtLogin: model.launchAtLogin
+            )
         } label: {
             Image(nsImage: Self.menuBarIcon)
                 .accessibilityLabel("OpenLogi")
@@ -64,9 +76,11 @@ private struct MenuBarContent: View {
     @Environment(\.openWindow) private var openWindow
     let store: ShortcutStore
     let engine: KeyboardEngine
+    let launchAtLogin: LaunchAtLoginController
 
     var body: some View {
         MenuBarRemappingToggle(store: store)
+        MenuBarLaunchAtLoginToggle(launchAtLogin: launchAtLogin)
         EngineStatusText(engine: engine)
         Divider()
         Button("Open Shortcuts…") {
@@ -76,6 +90,28 @@ private struct MenuBarContent: View {
         Button("Quit OpenLogi") {
             NSApplication.shared.terminate(nil)
         }
+    }
+}
+
+private struct MenuBarLaunchAtLoginToggle: View {
+    @ObservedObject var launchAtLogin: LaunchAtLoginController
+
+    var body: some View {
+        Group {
+            Toggle(
+                "Start at Login",
+                isOn: Binding(
+                    get: { launchAtLogin.isEnabled },
+                    set: { launchAtLogin.setEnabled($0) }
+                )
+            )
+            .disabled(!launchAtLogin.canToggle)
+
+            if launchAtLogin.requiresApproval {
+                Button("Approve Start at Login…", action: launchAtLogin.openSystemSettings)
+            }
+        }
+        .onAppear(perform: launchAtLogin.refresh)
     }
 }
 

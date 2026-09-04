@@ -1,4 +1,5 @@
 import Combine
+import ServiceManagement
 import XCTest
 @testable import OpenLogi
 
@@ -465,5 +466,106 @@ final class ShortcutTests: XCTestCase {
             status.label,
             "Accessibility and Input Monitoring permissions required"
         )
+    }
+
+    @MainActor
+    func testLaunchAtLoginStateMapping() {
+        XCTAssertEqual(
+            LaunchAtLoginController.state(for: .notRegistered),
+            .disabled
+        )
+        XCTAssertEqual(
+            LaunchAtLoginController.state(for: .enabled),
+            .enabled
+        )
+        XCTAssertEqual(
+            LaunchAtLoginController.state(for: .requiresApproval),
+            .requiresApproval
+        )
+        XCTAssertEqual(
+            LaunchAtLoginController.state(for: .notFound),
+            .disabled
+        )
+    }
+
+    @MainActor
+    func testLaunchAtLoginControllerRegistersAndUnregisters() {
+        let service = FakeLaunchAtLoginService(status: .notRegistered)
+        let controller = LaunchAtLoginController(service: service)
+
+        controller.setEnabled(true)
+        XCTAssertTrue(controller.isEnabled)
+        XCTAssertEqual(service.registerCount, 1)
+
+        controller.setEnabled(false)
+        XCTAssertFalse(controller.isEnabled)
+        XCTAssertEqual(service.unregisterCount, 1)
+    }
+
+    @MainActor
+    func testLaunchAtLoginControllerRegistersFromNotFound() {
+        let service = FakeLaunchAtLoginService(status: .notFound)
+        let controller = LaunchAtLoginController(service: service)
+
+        XCTAssertTrue(controller.canToggle)
+        XCTAssertFalse(controller.isEnabled)
+
+        controller.setEnabled(true)
+
+        XCTAssertTrue(controller.isEnabled)
+        XCTAssertEqual(service.registerCount, 1)
+    }
+
+    @MainActor
+    func testLaunchAtLoginApprovalRemainsRegistered() {
+        let service = FakeLaunchAtLoginService(status: .requiresApproval)
+        let controller = LaunchAtLoginController(service: service)
+
+        XCTAssertTrue(controller.isEnabled)
+        XCTAssertTrue(controller.requiresApproval)
+        XCTAssertNotNil(controller.notice)
+    }
+
+    @MainActor
+    func testLaunchAtLoginControllerSurfacesRegistrationFailure() {
+        let service = FakeLaunchAtLoginService(status: .notRegistered)
+        service.registrationError = NSError(
+            domain: "LaunchAtLoginTests",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "test failure"]
+        )
+        let controller = LaunchAtLoginController(service: service)
+
+        controller.setEnabled(true)
+
+        XCTAssertFalse(controller.isEnabled)
+        XCTAssertEqual(
+            controller.errorMessage,
+            "Could not enable Start at Login: test failure"
+        )
+    }
+}
+
+private final class FakeLaunchAtLoginService: LaunchAtLoginServicing {
+    var status: SMAppService.Status
+    var registrationError: Error?
+    var unregistrationError: Error?
+    private(set) var registerCount = 0
+    private(set) var unregisterCount = 0
+
+    init(status: SMAppService.Status) {
+        self.status = status
+    }
+
+    func register() throws {
+        registerCount += 1
+        if let registrationError { throw registrationError }
+        status = .enabled
+    }
+
+    func unregister() throws {
+        unregisterCount += 1
+        if let unregistrationError { throw unregistrationError }
+        status = .notRegistered
     }
 }

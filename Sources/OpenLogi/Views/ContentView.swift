@@ -5,18 +5,31 @@ struct ContentView: View {
     @ObservedObject var store: ShortcutStore
     let engine: KeyboardEngine
     let fnLock: LogitechFnLockController
+    @ObservedObject var launchAtLogin: LaunchAtLoginController
 
     var body: some View {
         ZStack {
             AppBrand.background
                 .ignoresSafeArea()
             VStack(spacing: 0) {
-                ContentHeader(store: store, engine: engine, fnLock: fnLock)
+                ContentHeader(
+                    store: store,
+                    engine: engine,
+                    fnLock: fnLock,
+                    launchAtLogin: launchAtLogin
+                )
                 Rectangle()
                     .fill(AppBrand.lava)
                     .frame(height: 3)
                 if let persistenceError = store.persistenceError {
                     PersistenceErrorBanner(message: persistenceError)
+                }
+                if let launchAtLoginNotice = launchAtLogin.notice {
+                    LaunchAtLoginNotice(
+                        message: launchAtLoginNotice,
+                        canOpenSettings: launchAtLogin.requiresApproval,
+                        openSettings: launchAtLogin.openSystemSettings
+                    )
                 }
                 RulesContent(store: store, engine: engine)
                 InputMonitor(activity: engine.activity)
@@ -35,8 +48,35 @@ struct ContentView: View {
             }
         }
         .background {
-            EngineLifecycleObserver(engine: engine, fnLock: fnLock)
+            EngineLifecycleObserver(
+                engine: engine,
+                fnLock: fnLock,
+                launchAtLogin: launchAtLogin
+            )
         }
+    }
+}
+
+private struct LaunchAtLoginNotice: View {
+    let message: String
+    let canOpenSettings: Bool
+    let openSettings: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Label(message, systemImage: "exclamationmark.triangle.fill")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if canOpenSettings {
+                Button("Open Login Items", action: openSettings)
+                    .buttonStyle(BrandButtonStyle(kind: .secondary))
+            }
+        }
+        .font(AppBrand.font(size: 12, weight: .medium))
+        .foregroundStyle(AppBrand.lava)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 9)
+        .background(AppBrand.lava.opacity(0.08))
+        .help(message)
     }
 }
 
@@ -82,6 +122,7 @@ private struct InputMonitor: View {
 private struct EngineLifecycleObserver: View {
     @ObservedObject var engine: KeyboardEngine
     let fnLock: LogitechFnLockController
+    let launchAtLogin: LaunchAtLoginController
     @State private var isApplicationActive = NSApplication.shared.isActive
 
     private var shouldRetryPermission: Bool {
@@ -122,6 +163,7 @@ private struct EngineLifecycleObserver: View {
         engine.start()
         fnLock.refresh()
         engine.refreshLogitechInput()
+        launchAtLogin.refresh()
     }
 
     private func retryPermissionWithBackoff() async {
@@ -145,6 +187,7 @@ private struct ContentHeader: View {
     let store: ShortcutStore
     @ObservedObject var engine: KeyboardEngine
     @ObservedObject var fnLock: LogitechFnLockController
+    @ObservedObject var launchAtLogin: LaunchAtLoginController
 
     var body: some View {
         HStack(spacing: 16) {
@@ -160,6 +203,8 @@ private struct ContentHeader: View {
             permissionActions
 
             fnLockControl
+
+            LaunchAtLoginToggle(launchAtLogin: launchAtLogin)
 
             RemappingToggle(store: store)
         }
@@ -274,6 +319,25 @@ private struct ContentHeader: View {
         case .stopped: AppBrand.secondaryText
         case .failed: AppBrand.lava
         }
+    }
+}
+
+private struct LaunchAtLoginToggle: View {
+    @ObservedObject var launchAtLogin: LaunchAtLoginController
+
+    var body: some View {
+        Toggle(
+            "Start at Login",
+            isOn: Binding(
+                get: { launchAtLogin.isEnabled },
+                set: { launchAtLogin.setEnabled($0) }
+            )
+        )
+        .font(AppBrand.font(size: 12, weight: .semibold))
+        .toggleStyle(.switch)
+        .fixedSize()
+        .disabled(!launchAtLogin.canToggle)
+        .help(launchAtLogin.notice ?? "Launch OpenLogi automatically when you sign in")
     }
 }
 

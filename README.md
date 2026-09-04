@@ -12,6 +12,7 @@ media keys, and compatible Logitech function keys.
 - Record keyboard, media-key, and compatible Logitech function-key input.
 - Map inputs to keyboard shortcuts or built-in macOS actions.
 - Control HID++ Fn mode on supported Logitech keyboards.
+- Optionally launch OpenLogi automatically when you sign in.
 - Keep remapping active after closing the main window.
 - Store configuration locally, with no network or analytics code.
 
@@ -39,6 +40,9 @@ The packaging script creates a local development signing identity in
 `.openlogi-signing/`. That directory is ignored and must never be committed.
 The resulting app is self-signed for local use and is not notarized for
 distribution.
+
+The **Start at Login** toggle uses macOS login-item registration and is
+available from the packaged, signed app rather than a `swift run` executable.
 
 ## Permissions
 

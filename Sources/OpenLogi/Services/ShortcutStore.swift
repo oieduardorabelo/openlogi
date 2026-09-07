@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import SwiftUI
 
 @MainActor
 final class ShortcutStore: ObservableObject {
@@ -75,6 +76,17 @@ final class ShortcutStore: ObservableObject {
 
     func removeRule(id: UUID) {
         rules.removeAll { $0.id == id }
+    }
+
+    func binding(for rule: ShortcutRule) -> Binding<ShortcutRule> {
+        Binding(
+            get: { self.rules.first(where: { $0.id == rule.id }) ?? rule },
+            set: { updated in
+                guard updated.id == rule.id,
+                      let index = self.rules.firstIndex(where: { $0.id == rule.id }) else { return }
+                self.rules[index] = updated
+            }
+        )
     }
 
     func rule(for input: KeyStroke) -> ShortcutRule? {

@@ -76,6 +76,7 @@ final class KeyboardEventWorker: @unchecked Sendable {
     private var captureToken: UInt64?
     private var onInput: (@Sendable (KeyStroke) -> Void)?
     private var onCapture: (@Sendable (UInt64, KeyStroke) -> Void)?
+    private var onCheck: (@Sendable (KeyboardCheckEvent) -> Void)?
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -110,6 +111,12 @@ final class KeyboardEventWorker: @unchecked Sendable {
         stateLock.unlock()
     }
 
+    func setCheckHandler(_ handler: (@Sendable (KeyboardCheckEvent) -> Void)?) {
+        stateLock.lock()
+        onCheck = handler
+        stateLock.unlock()
+    }
+
     func beginCapture(token: UInt64) {
         stateLock.lock()
         captureToken = token
@@ -130,6 +137,11 @@ final class KeyboardEventWorker: @unchecked Sendable {
         var captureHandler: (@Sendable (UInt64, KeyStroke) -> Void)?
 
         stateLock.lock()
+        if let onCheck {
+            stateLock.unlock()
+            onCheck(KeyboardCheckEvent(stroke: stroke, phase: isDown ? .pressed : .released))
+            return
+        }
         if isDown {
             if lastReportedInput != stroke {
                 lastReportedInput = stroke
@@ -199,7 +211,7 @@ final class KeyboardEventWorker: @unchecked Sendable {
     }
 
     private func runEventTap(latch: StartLatch) {
-        let eventTypes: [CGEventType] = [.keyDown, .keyUp, Self.systemDefinedType]
+        let eventTypes: [CGEventType] = [.keyDown, .keyUp, .flagsChanged, Self.systemDefinedType]
         let mask = eventTypes.reduce(CGEventMask(0)) {
             $0 | (CGEventMask(1) << $1.rawValue)
         }
@@ -242,7 +254,7 @@ final class KeyboardEventWorker: @unchecked Sendable {
         lifecycleLock.unlock()
     }
 
-    private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+    func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             recoverFromDisabledTap()
             return Unmanaged.passUnretained(event)
@@ -250,9 +262,41 @@ final class KeyboardEventWorker: @unchecked Sendable {
         if event.getIntegerValueField(.eventSourceUserData) == KeyboardOutput.syntheticEventTag {
             return Unmanaged.passUnretained(event)
         }
+        if type == .flagsChanged {
+            stateLock.lock()
+            let onCheck = self.onCheck
+            stateLock.unlock()
+            onCheck?(KeyboardCheckEvent(
+                stroke: .keyboard(
+                    Int(event.getIntegerValueField(.keyboardEventKeycode)),
+                    modifiers: ShortcutModifiers(eventFlags: event.flags)
+                ),
+                phase: .modifiersChanged,
+                capsLock: event.flags.contains(.maskAlphaShift)
+            ))
+            return Unmanaged.passUnretained(event)
+        }
         guard let parsed = parse(type: type, event: event) else {
             return Unmanaged.passUnretained(event)
         }
+
+        stateLock.lock()
+        if let onCheck {
+            let key = PhysicalKey(parsed.stroke)
+            if parsed.isDown {
+                suppressedUntilRelease.insert(key)
+            } else {
+                suppressedUntilRelease.remove(key)
+            }
+            stateLock.unlock()
+            onCheck(KeyboardCheckEvent(
+                stroke: parsed.stroke,
+                phase: parsed.isDown ? (parsed.isRepeat ? .repeated : .pressed) : .released,
+                capsLock: event.flags.contains(.maskAlphaShift)
+            ))
+            return nil
+        }
+        stateLock.unlock()
 
         let resolution = resolve(parsed)
         dispatch(resolution, stroke: parsed.stroke)

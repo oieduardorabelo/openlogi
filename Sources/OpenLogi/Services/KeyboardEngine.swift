@@ -74,6 +74,7 @@ final class KeyboardEngine: ObservableObject {
     private var lastLogitechConfiguration: LogitechConfiguration?
     private var storeObserver: AnyCancellable?
     private var terminationObserver: NSObjectProtocol?
+    private var checkSession: UUID?
 
     private struct LogitechConfiguration: Equatable {
         var positions: Set<Int>
@@ -133,6 +134,7 @@ final class KeyboardEngine: ObservableObject {
     }
 
     func stop() {
+        endKeyboardCheck()
         cancelCapture()
         logitechFunctionKeys?.stop()
         logitechFunctionKeys = nil
@@ -145,6 +147,25 @@ final class KeyboardEngine: ObservableObject {
     func refreshLogitechInput() {
         refreshLogitechDiversions()
         logitechFunctionKeys?.refresh()
+    }
+
+    func beginKeyboardCheck(_ handler: @escaping (KeyboardCheckEvent) -> Void) {
+        cancelCapture()
+        let session = UUID()
+        checkSession = session
+        eventWorker.setCheckHandler { [weak self] event in
+            Task { @MainActor in
+                guard self?.checkSession == session else { return }
+                handler(event)
+            }
+        }
+        start()
+    }
+
+    func endKeyboardCheck() {
+        checkSession = nil
+        eventWorker.setCheckHandler(nil)
+        refreshLogitechDiversions()
     }
 
     private func stopEventTap() {
@@ -246,11 +267,12 @@ final class KeyboardEngine: ObservableObject {
             return LogitechFunctionKeyHID.position(forKeyCode: input.keyCode)
         })
 
-        let configuration = LogitechConfiguration(positions: positions, capturesAll: isRecording)
+        let capturesAll = isRecording || checkSession != nil
+        let configuration = LogitechConfiguration(positions: positions, capturesAll: capturesAll)
         guard configuration != lastLogitechConfiguration else { return }
         lastLogitechConfiguration = configuration
 
-        guard !positions.isEmpty || isRecording else {
+        guard !positions.isEmpty || capturesAll else {
             logitechFunctionKeys?.update(requiredPositions: [], captureAll: false)
             return
         }
@@ -275,7 +297,7 @@ final class KeyboardEngine: ObservableObject {
             )
             logitechFunctionKeys = monitor
         }
-        logitechFunctionKeys?.update(requiredPositions: positions, captureAll: isRecording)
+        logitechFunctionKeys?.update(requiredPositions: positions, captureAll: capturesAll)
     }
 
     private static func missingPermissions() -> Set<RequiredPermission> {

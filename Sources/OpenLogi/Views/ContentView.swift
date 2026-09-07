@@ -6,6 +6,7 @@ struct ContentView: View {
     let engine: KeyboardEngine
     let fnLock: LogitechFnLockController
     @ObservedObject var launchAtLogin: LaunchAtLoginController
+    @State private var showsKeyboardChecker = false
 
     var body: some View {
         ZStack {
@@ -41,11 +42,17 @@ struct ContentView: View {
         .preferredColorScheme(.light)
         .frame(minWidth: 780, minHeight: 500)
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button("Keyboard Checker") { showsKeyboardChecker = true }
+                    .buttonStyle(BrandButtonStyle(kind: .secondary))
+                    .help("Detect keyboards and inspect key presses")
                 Button("+ New shortcut", action: store.addRule)
                     .buttonStyle(BrandButtonStyle(kind: .primary))
                     .help("Create a shortcut")
             }
+        }
+        .sheet(isPresented: $showsKeyboardChecker) {
+            KeyboardCheckerView(engine: engine)
         }
         .background {
             EngineLifecycleObserver(
@@ -405,9 +412,9 @@ private struct RulesContent: View {
                 }
                 .padding(.horizontal, 4)
 
-                ForEach($store.rules) { $rule in
+                ForEach(store.rules) { rule in
                     ShortcutRuleRow(
-                        rule: $rule,
+                        rule: store.binding(for: rule),
                         isDuplicate: store.isDuplicate(rule),
                         engine: engine,
                         onDelete: { store.removeRule(id: rule.id) }

@@ -21,16 +21,38 @@ enum AppBrand {
     static let control = oatMedium.opacity(0.62)
 
     static func font(size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        Font.custom(fontName(for: weight), size: size)
+        guard fontsRegistered else { return .system(size: size, weight: weight) }
+        return Font.custom(fontName(for: weight), size: size)
     }
 
     static func registerFonts() {
-        guard let url = Bundle.module.url(
-            forResource: "DMSans-Variable",
-            withExtension: "ttf"
-        ) else { return }
-        CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
+        _ = fontsRegistered
     }
+
+    static func fontResourceURL(in bundle: Bundle = .main) -> URL? {
+        // Packaged apps store resources in Contents/Resources; swift run places
+        // the resource bundle beside the executable. Bundle.module can trap.
+        let directories = [bundle.resourceURL, bundle.executableURL?.deletingLastPathComponent()]
+        for directory in directories.compactMap({ $0 }) {
+            let resourceBundle = Bundle(url: directory.appendingPathComponent("OpenLogi_OpenLogi.bundle"))
+            if let url = resourceBundle?.url(forResource: "DMSans-Variable", withExtension: "ttf") {
+                return url
+            }
+        }
+        return nil
+    }
+
+    private static let fontsRegistered: Bool = {
+        guard let url = fontResourceURL() else {
+            NSLog("OpenLogi: bundled font missing; using system fonts.")
+            return false
+        }
+        guard CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil) else {
+            NSLog("OpenLogi: bundled font registration failed; using system fonts.")
+            return false
+        }
+        return true
+    }()
 
     private static func fontName(for weight: Font.Weight) -> String {
         switch weight {
